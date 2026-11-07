@@ -4,6 +4,7 @@ const cors = require("cors");
 const { ObjectId } = require('mongodb');
 const bcrypt = require('bcrypt')
 const { connect } = require('./db');
+const { generateSearchParams, generateAppointment } = require('./openai');
 //const { generateSearchParams,generateRecipe } = require('./gemini');
 
 const mongoUri = process.env.MONGO_URI;
@@ -736,7 +737,201 @@ async function main() {
         app.get('/profile', verifyToken, (req, res) => {
             res.json({ message: 'This is a protected route', user: req.user });
         });
-        
+
+
+        app.get("/ai/appointments", async function (req, res) {
+            try {
+                // more code here later
+                const query = req.query.q;
+
+                const allClients = await db.collection('users').distinct('name');
+                const allStylists = await db.collection('stylists').distinct('name');
+                const allServices = await db.collection('services').distinct('name');
+
+                const searchParams = await generateSearchParams(query, allClients, allStylists, allServices);
+                const criteria = {};
+
+                if (searchParams.clients && searchParams.clients.length > 0) {
+                    criteria["client.name"] = {
+                        $in: searchParams.clients
+                    }
+                }
+
+                if (searchParams.stylists && searchParams.stylists.length > 0) {
+                    criteria["stylist.name"] = {
+                        $in: searchParams.stylists
+                    }
+                }
+
+                if (searchParams.services && searchParams.services.length > 0) {
+                    criteria["services.name"] = {
+                        $all: searchParams.services
+                    }
+                }
+
+                if (searchParams.date) {
+                    const start = new Date(`${searchParams.date}T00:00:00.000+08:00`);
+                    const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+
+                    criteria.dateTime = {
+                        $gte: start,
+                        $lt: end
+                    };
+                }
+
+                if (searchParams.status) {
+                    criteria.status = searchParams.status;
+                }
+
+                const appointments = await db.collection('appointments').find(criteria).toArray();
+                res.json({
+                    appointments
+                })
+
+            } catch (err) {
+                console.error('AI search error:', err);
+
+                const statusCode = [400, 422].includes(err.statusCode)
+                    ? err.statusCode
+                    : 500;
+
+                return res.status(statusCode).json({
+                    error: statusCode === 500
+                        ? 'Server error performing AI search'
+                        : err.message
+                });
+            }
+        });
+
+        app.post('/ai/appointments', async function (req, res) {
+            try {
+                const { appointmentText } = req.body ?? {};
+
+                const [allClients, allStylists, allServices] = await Promise.all([
+                    db.collection('users').distinct('name'),
+                    db.collection('stylists').distinct('name'),
+                    db.collection('services').distinct('name')
+                ]);
+
+                const extracted = await generateAppointment(
+                    appointmentText,
+                    allClients,
+                    allStylists,
+                    allServices
+                );
+
+                const [clients, stylists, serviceDocs] = await Promise.all([
+                    db.collection('users')
+                        .find(
+                            { name: extracted.client },
+                            { projection: { _id: 1, name: 1 } }
+                        )
+                        .limit(2)
+                        .toArray(),
+
+                    db.collection('stylists')
+                        .find({ name: extracted.stylist })
+                        .limit(2)
+                        .toArray(),
+
+                    db.collection('services')
+                        .find({ name: { $in: extracted.services } })
+                        .toArray()
+                ]);
+
+                if (clients.length !== 1 || stylists.length !== 1) {
+                    return res.status(422).json({
+                        error: 'Client or stylist name is missing or ambiguous. Use unique IDs.'
+                    });
+                }
+
+                // Ensure every requested service resolves to exactly one document.
+                if (
+                    extracted.services.some(name =>
+                        serviceDocs.filter(service => service.name === name).length !== 1
+                    )
+                ) {
+                    return res.status(422).json({
+                        error: 'A selected service is missing or has a duplicate name.'
+                    });
+                }
+
+                const clientDoc = clients[0];
+                const stylistDoc = stylists[0];
+
+                const selectedServices = extracted.services.map(name =>
+                    serviceDocs.find(service => service.name === name)
+                );
+
+                const specialtyIds = (stylistDoc.specialties ?? []).map(
+                    specialty => String(specialty._id ?? specialty)
+                );
+
+                const unsupported = selectedServices.filter(
+                    service => !specialtyIds.includes(String(service._id))
+                );
+
+                if (unsupported.length > 0) {
+                    return res.status(422).json({
+                        error: 'The stylist does not offer some selected services.',
+                        services: unsupported.map(service => service.name)
+                    });
+                }
+
+                const now = new Date();
+
+                const appointment = {
+                    client: {
+                        _id: clientDoc._id,
+                        name: clientDoc.name
+                    },
+                    stylist: {
+                        _id: stylistDoc._id,
+                        name: stylistDoc.name
+                    },
+                    services: selectedServices.map(service => ({
+                        _id: service._id,
+                        name: service.name
+                    })),
+                    dateTime: extracted.dateTime,
+                    totalDuration: selectedServices.reduce(
+                        (total, service) => total + service.duration,
+                        0
+                    ),
+                    totalPrice: Math.round(
+                        selectedServices.reduce(
+                            (total, service) => total + service.price,
+                            0
+                        ) * 100
+                    ) / 100,
+                    status: 'pending',
+                    createdAt: now,
+                    updatedAt: now
+                };
+
+                const result = await db
+                    .collection('appointments')
+                    .insertOne(appointment);
+
+                return res.status(201).json({
+                    message: 'Appointment created successfully.',
+                    appointmentId: result.insertedId,
+                    appointment
+                });
+            } catch (error) {
+                console.error('AI appointment creation failed:', error);
+
+                const statusCode = [400, 422].includes(error.statusCode)
+                    ? error.statusCode
+                    : 500;
+
+                return res.status(statusCode).json({
+                    error: statusCode === 500
+                        ? 'Server error creating appointment.'
+                        : error.message
+                });
+            }
+        });
         // START SERVER
         app.listen(3000, () => {
             console.log("Server has started on port 3000");
