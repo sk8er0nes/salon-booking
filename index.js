@@ -50,7 +50,7 @@ async function main() {
         app.get('/appointments', async (req, res) => {
             try {
                 const { client, stylist, services, date } = req.query;
-                //const { client } = req.query;
+                
                 let query = {};
 
                 if (client) {
