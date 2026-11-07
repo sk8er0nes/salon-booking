@@ -5,7 +5,7 @@ const { ObjectId } = require('mongodb');
 const bcrypt = require('bcrypt')
 const { connect } = require('./db');
 const { generateSearchParams, generateAppointment } = require('./openai');
-//const { generateSearchParams,generateRecipe } = require('./gemini');
+//const { generateSearchParams,generateAppointment } = require('./gemini');
 
 const mongoUri = process.env.MONGO_URI;
 const dbname = "salon_booking";
@@ -50,7 +50,7 @@ async function main() {
         app.get('/appointments', async (req, res) => {
             try {
                 const { client, stylist, services, date } = req.query;
-                
+
                 let query = {};
 
                 if (client) {
@@ -625,8 +625,127 @@ async function main() {
             }
         });
 
-        //Add users        
-        app.use(express.json());
+
+        //Add review on Appointment API
+        app.post('/stylists/:id/reviews', async (req, res) => {
+            try {
+                const stylistId = req.params.id;
+                const { user, rating, comment } = req.body;
+
+                // Basic validation
+                if (!user || !rating || !comment) {
+                    return res.status(400).json({ error: 'Missing required fields' });
+                }
+
+                // Create the new review object
+                const newReview = {
+                    review_id: new ObjectId(),
+                    user,
+                    rating: Number(rating),
+                    comment,
+                    date: new Date()
+                };
+
+                // Add the review to the Appointment
+                const result = await db.collection('stylists').updateOne(
+                    { _id: new ObjectId(stylistId) },
+                    { $push: { reviews: newReview } }
+                );
+
+                if (result.matchedCount === 0) {
+                    return res.status(404).json({ error: 'Stylist not found' });
+                }
+
+                res.status(201).json({
+                    message: 'Review added successfully',
+                    reviewId: newReview.review_id
+                });
+            } catch (error) {
+                console.error('Error adding review:', error);
+                res.status(500).json({ error: 'Internal server error' });
+            }
+        });
+
+
+        //Update review API
+        app.put('/stylists/:stylistId/reviews/:reviewId', async (req, res) => {
+            try {
+                const stylistId = req.params.stylistId;
+                const reviewId = req.params.reviewId;
+                const { user, rating, comment } = req.body;
+
+                // Basic validation
+                if (!user || !rating || !comment) {
+                    return res.status(400).json({ error: 'Missing required fields' });
+                }
+
+                // Create the updated review object
+                const updatedReview = {
+                    review_id: new ObjectId(reviewId),
+                    user,
+                    rating: Number(rating),
+                    comment,
+                    date: new Date()  // Update the date to reflect the edit time
+                };
+
+                // Update the specific review in the Stylist document
+                const result = await db.collection('stylists').updateOne(
+                    {
+                        _id: new ObjectId(stylistId),
+                        "reviews.review_id": new ObjectId(reviewId)
+                    },
+                    {
+                        $set: { "reviews.$": updatedReview }
+                    }
+                );
+
+                if (result.matchedCount === 0) {
+                    return res.status(404).json({ error: 'Stylist or review not found' });
+                }
+
+                res.json({
+                    message: 'Review updated successfully',
+                    reviewId: reviewId
+                });
+            } catch (error) {
+                console.error('Error updating review:', error);
+                res.status(500).json({ error: 'Internal server error' });
+            }
+        });
+
+        //Delete the review on Stylist API
+        app.delete('/stylists/:stylistId/reviews/:reviewId', async (req, res) => {
+            try {
+                const stylistId = req.params.stylistId;
+                const reviewId = req.params.reviewId;
+
+                // Remove the specific review from the Appointment document
+                const result = await db.collection('stylists').updateOne(
+                    { _id: new ObjectId(stylistId) },
+                    {
+                        $pull: {
+                            reviews: { review_id: new ObjectId(reviewId) }
+                        }
+                    }
+                );
+
+                if (result.matchedCount === 0) {
+                    return res.status(404).json({ error: 'Stylist not found' });
+                }
+
+                if (result.modifiedCount === 0) {
+                    return res.status(404).json({ error: 'Review not found' });
+                }
+
+                res.json({
+                    message: 'Review deleted successfully'
+                });
+            } catch (error) {
+                console.error('Error deleting review:', error);
+                res.status(500).json({ error: 'Internal server error' });
+            }
+        });
+
 
         app.post('/users', async (req, res) => {
             try {
